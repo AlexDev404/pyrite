@@ -4,7 +4,7 @@
 
 Removes AES and Oodle compression from Fortnite. Tested on Fortnite 17.50
 
-Forked from [Cobalt](https://github.com/Milxnor/Cobalt) and trimmed down for use as the AES-GCM + Oodle bypass loader paired with the Project-Reboot-3.0 standalone server.
+Hard-forked from [Cobalt](https://github.com/Milxnor/Cobalt) and trimmed down for use as the AES-GCM + Oodle bypass loader paired with the Project-Reboot-3.0 standalone server.
 
 The original Cobalt's SSL bypass / URL redirection / exit-popup hooks (curlhook.h, exithook.h) are kept in the tree but not initialized from `dllmain.cpp` — Pyrite only installs `InitializeAESBypass()` and `InitializeOodleBypass()` so the standalone can see plaintext PacketHandler bunches.
 
