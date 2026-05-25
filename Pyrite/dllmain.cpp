@@ -1,8 +1,9 @@
-// Cobalt — minimal AES-bypass loader for Fortnite 17.50 (UE 4.26.1).
+// Pyrite -- minimal AES-bypass loader for Fortnite 17.50 (UE 4.26.1).
 //
-// The full Cobalt also redirects HTTPS endpoints and disables a few exit/quit
-// pop-ups; the user manually disabled that in this build and we left it out.
-// Only AES-GCM bypass is active here.
+// Forked from the Cobalt loader (which also did HTTPS redirection + exit-popup
+// hooks via curlhook.h/exithook.h). Pyrite strips those out and adds Oodle
+// compression bypass alongside the AES-GCM bypass so the standalone server
+// can see plaintext PacketHandler bunches.
 
 #include <Windows.h>
 #include <iostream>
@@ -29,7 +30,7 @@ DWORD WINAPI Main(LPVOID)
     FILE* fptr;
     freopen_s(&fptr, "CONOUT$", "w+", stdout);
 
-    std::cout << "Cobalt (AES-bypass build) initializing\n";
+    std::cout << "Pyrite (AES-bypass build) initializing\n";
 
 #ifdef USE_MINHOOK
     MH_Initialize();
@@ -40,7 +41,7 @@ DWORD WINAPI Main(LPVOID)
     if (!InitializeAESBypass())
     {
         std::cout << "[AESBypass] Failed -- packets will stay encrypted.\n";
-        MessageBoxA(0, "Failed to install AES bypass hooks!", "Cobalt", MB_ICONERROR);
+        MessageBoxA(0, "Failed to install AES bypass hooks!", "Pyrite", MB_ICONERROR);
         return 0;
     }
 
@@ -49,7 +50,7 @@ DWORD WINAPI Main(LPVOID)
         std::cout << "[OodleBypass] Failed -- packets will stay compressed.\n";
     }
 
-    std::cout << "Cobalt ready.\n";
+    std::cout << "Pyrite ready.\n";
     return 0;
 }
 

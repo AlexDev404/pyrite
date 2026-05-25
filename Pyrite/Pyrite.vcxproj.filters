@@ -20,19 +20,13 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="curlhook.h">
+    <ClInclude Include="aesgcmhook.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="memcury.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="exithook.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="settings.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="url.h">
+    <ClInclude Include="oodlehook.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

@@ -13,8 +13,7 @@ void Hook(void* Target, void* Detour);
 // AES-GCM and advances the FBitReader position past the encryption header.
 //
 // Replaced with: immediate return, leaving the FBitReader bitstream exactly
-// as received. The standalone server does not run UE4's PacketHandler chain
-// and never writes an encryption marker bit, so this stays symmetric.
+// as received.
 //
 // Calling convention (x64 __thiscall == __fastcall):
 //   RCX = this  (FAESGCMHandlerComponent*)
@@ -31,9 +30,7 @@ inline void __fastcall AESIncoming_Hook(void* /*thisPtr*/, void* /*packet*/)
 // Original behaviour: encrypts the outgoing packet payload in-place and
 // writes a 1-bit "encrypted" marker into the FBitWriter stream.
 //
-// Replaced with: immediate return. Without the encryption marker bit the
-// standalone server (which does not run an AES handler) will read PackedHeader
-// directly after the magic+handshake preamble.
+// Replaced with: immediate return.
 //
 // Calling convention:
 //   RCX = this  (FAESGCMHandlerComponent*)
@@ -45,49 +42,49 @@ inline void __fastcall AESOutgoing_Hook(void* /*thisPtr*/, void* /*packet*/,
 {
     // Intentionally empty -- packet passes through unmodified.
     //
-    // FALLBACK: if the client disconnects immediately after handshake with no
-    // 24-byte packets appearing, Fortnite has a "drop if marker bit absent"
-    // check. In that case replace this body with a single WriteBit(0) call
-    // to write a 0 marker bit instead of skipping entirely. Don't change
-    // this preemptively -- only if you see that specific disconnect pattern.
+    // FALLBACK: if client disconnects immediately after handshake with no
+    // 24-byte packets appearing, replace this body with WriteBit(0).
 }
 
 // ---------------------------------------------------------------------------
 // InitializeAESBypass
 //
 // Locates FAESGCMHandlerComponent::Incoming and ::Outgoing via sigscan and
-// replaces both with identity stubs. Call this from Main() in dllmain.cpp
-// after InitializeExitHook() and before any network activity begins.
+// replaces both with identity stubs.
 //
-// Signatures derived from Fortnite 17.50 (UE 4.26.1) -- FortniteClient-Win64-Shipping.exe
+// Signatures derived from Fortnite 17.50 (UE 4.26.1) FortniteClient-Win64-Shipping.exe
+// Functions confirmed at sub_143F5FB68 (Incoming) and sub_143F6003C (Outgoing).
 //
-// Incoming prologue (sub_143f5fb68):
-//   48 89 5C 24 10            mov  [rsp+0x10], rbx
-//   55 56 57 41 54 41 55      push rbp/rsi/rdi/r12/r13
-//   41 56 41 57               push r14/r15
-//   48 8D 6C 24 D9            lea  rbp, [rsp-0x27]   <- frame cookie; D9 is unique to Incoming
-//   48 81 EC 90 00 00 00      sub  rsp, 0x90
+// Previous sig was too generic and grabbed an unrelated function with the
+// same push sequence (runtime offset 0xCC8304 instead of 0x3F5FB68). The new
+// sigs extend into the unique function body where register choices diverge:
 //
-// Outgoing prologue (sub_143f6003c):
-//   identical save sequence, then:
-//   48 8D 6C 24 B0            lea  rbp, [rsp-0x50]   <- B0 distinguishes Outgoing from Incoming
-//   48 81 EC 50 01 00 00      sub  rsp, 0x150         <- larger frame (crypto scratch space)
+// Incoming distinctive bytes:
+//   48 8D 6C 24 D9        lea rbp, [rsp-0x27]    frame cookie D9 unique to Incoming
+//   48 81 EC 90 00 00 00  sub rsp, 0x90
+//   48 8B 01              mov rax, [rcx]         vtable load
+//   48 8D 1D ?? ?? ?? ??  lea rbx, [rel STAT_PacketHandler_AESGCM_Decrypt]
+//   45 33 ED              xor r13d, r13d         r13 (vs r15 in Outgoing)
+//   48 8B FA              mov rdi, rdx
 //
-// If either sig drifts in a later 17.x patch, re-derive from the two strings
-// that anchor these functions:
-//   Incoming: u"FAESGCMHandlerComponent::Incoming: received encrypted packet before key was set, ignoring."
-//   Outgoing: u"FAESGCMHandlerComponent::Outgoing: failed to write encryption bit."
-// Both survive in the .rdata of shipping builds.
+// Outgoing distinctive bytes:
+//   48 8D 6C 24 B0        lea rbp, [rsp-0x50]    frame cookie B0 unique to Outgoing
+//   48 81 EC 50 01 00 00  sub rsp, 0x150
+//   48 8B 01              mov rax, [rcx]
+//   4C 8D 25 ?? ?? ?? ??  lea r12, [rel STAT_PacketHandler_AESGCM_Encrypt]
+//   45 33 FF              xor r15d, r15d         r15 (vs r13 in Incoming)
+//   48 8B DA              mov rbx, rdx
 // ---------------------------------------------------------------------------
 inline bool InitializeAESBypass()
 {
-    // -----------------------------------------------------------------------
-    // Locate Incoming
-    // -----------------------------------------------------------------------
     const __int64 incomingAddr = Memcury::Scanner::FindPattern(
-        "48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 "
-        "48 8D 6C 24 D9 "           // lea rbp, [rsp-0x27]  -- frame size unique to Incoming
-        "48 81 EC 90 00 00 00"      // sub rsp, 0x90
+        "48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 " // save rbx/rbp, push rsi-r15
+        "48 8D 6C 24 D9 "                                  // lea rbp, [rsp-0x27]
+        "48 81 EC 90 00 00 00 "                            // sub rsp, 0x90
+        "48 8B 01 "                                        // mov rax, [rcx]
+        "48 8D 1D ? ? ? ? "                                // lea rbx, [rel STAT_Decrypt]
+        "45 33 ED "                                        // xor r13d, r13d
+        "48 8B FA"                                         // mov rdi, rdx
     ).Get();
 
     if (!incomingAddr)
@@ -96,13 +93,14 @@ inline bool InitializeAESBypass()
         return false;
     }
 
-    // -----------------------------------------------------------------------
-    // Locate Outgoing
-    // -----------------------------------------------------------------------
     const __int64 outgoingAddr = Memcury::Scanner::FindPattern(
-        "48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 "
-        "48 8D 6C 24 B0 "           // lea rbp, [rsp-0x50]  -- frame size unique to Outgoing
-        "48 81 EC 50 01 00 00"      // sub rsp, 0x150
+        "48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 " // prologue
+        "48 8D 6C 24 B0 "                                  // lea rbp, [rsp-0x50]
+        "48 81 EC 50 01 00 00 "                            // sub rsp, 0x150
+        "48 8B 01 "                                        // mov rax, [rcx]
+        "4C 8D 25 ? ? ? ? "                                // lea r12, [rel STAT_Encrypt]
+        "45 33 FF "                                        // xor r15d, r15d
+        "48 8B DA"                                         // mov rbx, rdx
     ).Get();
 
     if (!outgoingAddr)
