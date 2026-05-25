@@ -30,7 +30,7 @@ DWORD WINAPI Main(LPVOID)
     FILE* fptr;
     freopen_s(&fptr, "CONOUT$", "w+", stdout);
 
-    std::cout << "Pyrite (AES-bypass build) initializing\n";
+    std::cout << "Pyrite (AES-bypass) initializing\nAuthor: Immanuel Daviel A. Garcia";
 
 #ifdef USE_MINHOOK
     MH_Initialize();
