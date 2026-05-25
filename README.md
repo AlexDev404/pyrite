@@ -1,4 +1,8 @@
+<img width="160" height="148" alt="image" src="https://github.com/user-attachments/assets/1e031b5a-45cb-4c0f-92c3-e2c5d589fddb" />
+
 # Pyrite
+
+Removes AES and Oodle compression from Fortnite. Tested on Fortnite 17.50
 
 Forked from [Cobalt](https://github.com/Milxnor/Cobalt) and trimmed down for use as the AES-GCM + Oodle bypass loader paired with the Project-Reboot-3.0 standalone server.
 
