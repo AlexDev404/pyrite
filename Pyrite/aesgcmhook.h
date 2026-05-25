@@ -75,6 +75,29 @@ inline void __fastcall AESOutgoing_Hook(void* /*thisPtr*/, void* /*packet*/,
 //   45 33 FF              xor r15d, r15d         r15 (vs r13 in Incoming)
 //   48 8B DA              mov rbx, rdx
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// OpenSSL GCM wrappers -- belt-and-suspenders bypass
+//
+// Even with FAESGCMHandlerComponent::Outgoing/Incoming neutered, some packet
+// paths reach the lower-level wrappers directly:
+//   sub_143F60EAC = STAT_OpenSSL_AES256_GCM_Encrypt wrapper
+//   sub_143F60B44 = STAT_OpenSSL_AES256_GCM_Decrypt wrapper
+//
+// Both return their output-buffer pointer (rdx == the 2nd arg) in rax, so
+// the detour returns that to keep callers happy.
+// ---------------------------------------------------------------------------
+inline void* __fastcall OpenSSLEncrypt_Hook(void* /*ctx*/, void* outBuf,
+                                            void* /*a3*/, void* /*a4*/)
+{
+    return outBuf;  // mimic the function's normal "return r14 (rdx)" tail.
+}
+
+inline void* __fastcall OpenSSLDecrypt_Hook(void* /*ctx*/, void* outBuf,
+                                            void* /*a3*/, void* /*a4*/)
+{
+    return outBuf;  // mimic the function's normal "return rsi (rdx)" tail.
+}
+
 inline bool InitializeAESBypass()
 {
     const __int64 incomingAddr = Memcury::Scanner::FindPattern(
@@ -114,6 +137,58 @@ inline bool InitializeAESBypass()
 
     Hook(reinterpret_cast<void*>(incomingAddr), AESIncoming_Hook);
     Hook(reinterpret_cast<void*>(outgoingAddr), AESOutgoing_Hook);
+
+    // ----- Lower-level OpenSSL wrappers --------------------------------------
+    // Encrypt (sub_143F60EAC): 3 rsp-relative saves before pushes, frame 0x60,
+    // zeroes r15d. All immediate displacements wildcarded.
+    const __int64 sslEncryptAddr = Memcury::Scanner::FindPattern(
+        "48 89 5C 24 ? "                           // mov [rsp+disp8], rbx
+        "4C 89 44 24 ? "                           // mov [rsp+disp8], r8
+        "48 89 4C 24 ? "                           // mov [rsp+disp8], rcx
+        "55 56 57 41 54 41 55 41 56 41 57 "        // push rbp/rsi/rdi/r12-r15
+        "? ? ? "                                   // mov rbp, rsp
+        "48 83 EC 60 "                             // sub rsp, 0x60   (Encrypt frame)
+        "4C 8B 65 ? "                              // mov r12, [rbp+disp8]
+        "48 8D 3D ? ? ? ? "                        // lea rdi, [STAT_Encrypt]
+        "45 33 FF"                                 // xor r15d, r15d  (Encrypt)
+    ).Get();
+
+    // Decrypt (sub_143F60B44): 2 rsp-relative saves before pushes, frame 0x50,
+    // zeroes edi.
+    const __int64 sslDecryptAddr = Memcury::Scanner::FindPattern(
+        "48 89 5C 24 ? "                           // mov [rsp+disp8], rbx
+        "48 89 4C 24 ? "                           // mov [rsp+disp8], rcx
+        "55 56 57 41 54 41 55 41 56 41 57 "        // push rbp/rsi/rdi/r12-r15
+        "? ? ? "                                   // mov rbp, rsp
+        "48 83 EC 50 "                             // sub rsp, 0x50   (Decrypt frame)
+        "48 8B 45 ? "                              // mov rax, [rbp+disp8]
+        "4C 8D 3D ? ? ? ? "                        // lea r15, [STAT_Decrypt]
+        "4C 8B 6D ? "                              // mov r13, [rbp+disp8]
+        "48 8D 4D ? "                              // lea rcx, [rbp+disp8]
+        "33 FF"                                    // xor edi, edi   (Decrypt)
+    ).Get();
+
+    if (sslEncryptAddr)
+    {
+        std::cout << "[AESBypass] OpenSSL_Encrypt @ "
+                  << reinterpret_cast<void*>(sslEncryptAddr) << '\n';
+        Hook(reinterpret_cast<void*>(sslEncryptAddr), OpenSSLEncrypt_Hook);
+    }
+    else
+    {
+        std::cout << "[AESBypass] sigscan failed for OpenSSL AES256_GCM_Encrypt\n";
+    }
+
+    if (sslDecryptAddr)
+    {
+        std::cout << "[AESBypass] OpenSSL_Decrypt @ "
+                  << reinterpret_cast<void*>(sslDecryptAddr) << '\n';
+        Hook(reinterpret_cast<void*>(sslDecryptAddr), OpenSSLDecrypt_Hook);
+    }
+    else
+    {
+        std::cout << "[AESBypass] sigscan failed for OpenSSL AES256_GCM_Decrypt\n";
+    }
 
     std::cout << "[AESBypass] AES-GCM encrypt/decrypt hooks installed.\n";
     return true;
