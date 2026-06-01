@@ -29,6 +29,13 @@ namespace BunchHook
     // pass-through artifacts.
     constexpr uintptr_t RVA_FNameRead = 0x00E715D0;
 
+    // FBitReader virtual method implementations (vtable+0x150/0x160/0x168).
+    // Hooking the impls (not the vtable) gives us a full bit-by-bit transcript
+    // of every read inside UNetConnection::ReceivedPacket.
+    constexpr uintptr_t RVA_SerializeBits      = 0x010AB330;
+    constexpr uintptr_t RVA_SerializeInt       = 0x00CD4D30;
+    constexpr uintptr_t RVA_SerializeIntPacked = 0x00F74234;
+
     // FBitReader struct offsets, per HLIL (arg2 treated as qword-indexed):
     //   arg2[0x13] (= byte +0x98) -> Buffer.Data
     //   arg2[0x15] (= byte +0xA8) -> Num bits
@@ -43,14 +50,253 @@ namespace BunchHook
     using ReceivedPacket_t    = void (__fastcall *)(void* thisConn, void* bitReader, bool bIsReinjected);
     using ReceivedRawPacket_t = void (__fastcall *)(void* thisConn, void* data, int32_t count);
     using FNameRead_t         = void* (__fastcall *)(void* thisAr, void* outName);
+    using SerializeBits_t      = void (__fastcall *)(void* thisAr, void* dest, int64_t lengthBits);
+    using SerializeInt_t       = void (__fastcall *)(void* thisAr, uint32_t* outValue, uint32_t valueMax);
+    using SerializeIntPacked_t = void (__fastcall *)(void* thisAr, uint32_t* outValue);
 
-    inline ReceivedPacket_t    ReceivedPacket_Orig    = nullptr;
-    inline ReceivedRawPacket_t ReceivedRawPacket_Orig = nullptr;
-    inline FNameRead_t         FNameRead_Orig         = nullptr;
+    inline ReceivedPacket_t      ReceivedPacket_Orig      = nullptr;
+    inline ReceivedRawPacket_t   ReceivedRawPacket_Orig   = nullptr;
+    inline FNameRead_t           FNameRead_Orig           = nullptr;
+    inline SerializeBits_t       SerializeBits_Orig       = nullptr;
+    inline SerializeInt_t        SerializeInt_Orig        = nullptr;
+    inline SerializeIntPacked_t  SerializeIntPacked_Orig  = nullptr;
 
     inline thread_local bool g_InRecv = false;
     inline thread_local bool g_InRaw  = false;
     inline thread_local void* g_ActiveReader = nullptr; // populated while inside ReceivedPacket
+
+    // -----------------------------------------------------------------------
+    // Shadow bit reader + packet decoder.
+    // Decodes one raw game packet field-by-field using our current layout
+    // understanding (Binja sub_140F79464 for Fortnite 17.50 / EngineNetVer=18).
+    // Run before the original so results are visible even if the original crashes.
+    // -----------------------------------------------------------------------
+    struct SBR // Shadow Bit Reader
+    {
+        const uint8_t* buf;
+        int64_t pos;
+        int64_t num;
+        bool err = false;
+
+        SBR(const uint8_t* data, int64_t numBits) : buf(data), pos(0), num(numBits) {}
+
+        uint8_t ReadBit()
+        {
+            if (pos >= num) { err = true; return 0; }
+            uint8_t v = (buf[pos >> 3] >> (pos & 7)) & 1;
+            ++pos;
+            return v;
+        }
+
+        uint32_t ReadBitsLE(int n) // n ≤ 32, LSB-first
+        {
+            uint32_t v = 0;
+            for (int i = 0; i < n && !err; ++i)
+                v |= (uint32_t)ReadBit() << i;
+            return v;
+        }
+
+        // UE4 ReadInt(Max): reads ceil(log2(Max)) bits (bit-saving bounded int)
+        uint32_t ReadInt(uint32_t Max)
+        {
+            uint32_t v = 0;
+            for (uint32_t mask = 1; mask < Max && !err; mask <<= 1)
+                if (ReadBit()) v |= mask;
+            return v;
+        }
+
+        // UE4 SerializeIntPacked: each byte = [bit0=continue][bits1-7=data]
+        uint32_t ReadSIP()
+        {
+            uint32_t val = 0;
+            for (int it = 0, shift = 0; it < 5 && !err; ++it, shift += 7)
+            {
+                if (pos + 8 > num) { err = true; break; }
+                const uint8_t* src = buf + (pos >> 3);
+                uint32_t used = pos & 7;
+                uint32_t left = 8 - used;
+                uint8_t m0 = uint8_t((1u << left) - 1u);
+                uint8_t m1 = uint8_t((1u << used) - 1u);
+                uint32_t nxt = (used != 0) ? 1 : 0;
+                uint8_t byte = ((src[0] >> used) & m0) | ((src[nxt] & m1) << (left & 7));
+                pos += 8;
+                uint8_t cont = byte & 1;
+                val |= (uint32_t)(byte >> 1) << shift;
+                if (!cont) break;
+            }
+            return val;
+        }
+
+        // Skip num_bytes of SerializeBits (UE4 byte-aligned serialization)
+        void SkipBytes(int n) { for (int i = 0; i < n*8 && !err; ++i) ReadBit(); }
+    };
+
+    inline void ShadowDecodePacket(const uint8_t* data, int32_t count)
+    {
+        if (count < 4 || count >= 4096) return;
+
+        // --- find stop bit (highest set bit in last non-zero byte, MSB-first scan) ---
+        int64_t numBits = (int64_t)count * 8;
+        for (int i = count - 1; i >= 0; --i)
+        {
+            if (data[i] == 0) { numBits -= 8; continue; }
+            for (int b = 7; b >= 0; --b)
+            {
+                if (data[i] & (1u << b)) { numBits = (int64_t)i * 8 + b; break; }
+            }
+            break;
+        }
+
+        SBR r(data, numBits);
+        std::printf("[shadow] --- decoding %d bytes (%lld bits) ---\n",
+                    count, (long long)numBits);
+
+        // --- MagicHeader (4 bits, 0b0111 LSB-first) ---
+        uint32_t magic = r.ReadBitsLE(4);
+        if ((magic & 0xF) != 0x7)
+        {
+            std::printf("[shadow]   magic=0x%X (not a game packet, skipping)\n", magic);
+            std::fflush(stdout);
+            return;
+        }
+
+        // --- PacketNotify packed header (32 bits raw LE) ---
+        // Layout: bits[0..3]=HWC-1, bits[4..17]=AckedSeq, bits[18..31]=Seq
+        uint32_t hdr = r.ReadBitsLE(32);
+        uint32_t hwc  = (hdr & 0xF) + 1;
+        uint32_t ack  = (hdr >> 4)  & 0x3FFF;
+        uint32_t seq  = (hdr >> 18) & 0x3FFF;
+        std::printf("[shadow]   PacketNotify: Seq=%u AckedSeq=%u HistoryWords=%u\n",
+                    seq, ack, hwc);
+
+        // --- History words (hwc × 32 bits) ---
+        for (uint32_t i = 0; i < hwc && !r.err; ++i)
+            r.ReadBitsLE(32);
+
+        // --- PacketInfo (EngineNetVer>=14): bHasFT + jitter + bHasServerFrameTimeByte + byte ---
+        uint8_t bHasFT = r.ReadBit();
+        uint32_t jitter = 0;
+        if (bHasFT) jitter = r.ReadInt(1024);
+        uint8_t bHasSFT = r.ReadBit();
+        uint8_t sftByte = 0;
+        if (bHasSFT) sftByte = (uint8_t)r.ReadBitsLE(8);
+        std::printf("[shadow]   PacketInfo: bHasFT=%u jitter=%u bHasSFT=%u sft=%u  pos=%lld bitsLeft=%lld\n",
+                    bHasFT, jitter, bHasSFT, sftByte, (long long)r.pos, (long long)(r.num - r.pos));
+
+        // --- Bunch loop ---
+        int bunchIdx = 0;
+        while (!r.err && (r.num - r.pos) >= 22)
+        {
+            int64_t bunchStart = r.pos;
+            std::printf("[shadow]   Bunch[%d] start pos=%lld bitsLeft=%lld\n",
+                        bunchIdx, (long long)r.pos, (long long)(r.num - r.pos));
+
+            // Bunch flag layout (empirically derived, client6/server6 gap analysis):
+            //   bOpen=0          → 2 bits (bOpen + bReliable)
+            //   bOpen=1,Close=0  → 3 bits (bOpen + bClose + bReliable)
+            //   bOpen=1,Close=1  → 5 bits (bOpen + bClose + CloseReason(2) + bReliable)
+            // bIsReplicationPaused is NOT in the wire format.
+            uint8_t bOpen        = r.ReadBit();
+            uint8_t bClose       = 0;
+            uint32_t closeReason = 0;
+            if (bOpen)
+            {
+                bClose = r.ReadBit();
+                if (bClose)
+                    closeReason = r.ReadInt(4); // ReadInt(4) = 2 bits
+            }
+            uint8_t bReliable = r.ReadBit(); // unconditional
+
+            std::printf("[shadow]     bOpen=%u bClose=%u closeReason=%u bReliable=%u  pos=%lld\n",
+                        bOpen, bClose, closeReason, bReliable, (long long)r.pos);
+
+            // ChIndex (EngineNetVer>=3 → SerializeIntPacked)
+            int64_t preChIdx = r.pos;
+            uint32_t chIndex = r.ReadSIP();
+            std::printf("[shadow]     ChIndex=%u (read %lld bits)  pos=%lld\n",
+                        chIndex, (long long)(r.pos - preChIdx), (long long)r.pos);
+
+            // ReadA / ReadB / ReadC
+            uint8_t bHasPMExports = r.ReadBit();
+            uint8_t bHasMBMGuids  = r.ReadBit();
+            uint8_t bPartial      = r.ReadBit();
+            std::printf("[shadow]     bHasPMExports=%u bHasMBMGuids=%u bPartial=%u  pos=%lld\n",
+                        bHasPMExports, bHasMBMGuids, bPartial, (long long)r.pos);
+
+            // ChSequence gated on bReliable
+            uint32_t chSeq = 0;
+            if (bReliable)
+            {
+                chSeq = r.ReadInt(1024);
+                std::printf("[shadow]     ChSequence=%u  pos=%lld\n",
+                            chSeq, (long long)r.pos);
+            }
+
+            // bPartial extras
+            uint8_t bPartialInitial = 0, bPartialFinal = 0;
+            if (bPartial)
+            {
+                bPartialInitial = r.ReadBit();
+                bPartialFinal   = r.ReadBit();
+                std::printf("[shadow]     bPartialInitial=%u bPartialFinal=%u  pos=%lld\n",
+                            bPartialInitial, bPartialFinal, (long long)r.pos);
+            }
+
+            // ChName: gated on bOpen || bReliable, EngineNetVer>=6 → FName path (no ChType)
+            if (bOpen || bReliable)
+            {
+                uint8_t bHardcoded = r.ReadBit();
+                std::printf("[shadow]     FName: bHardcoded=%u  pos=%lld\n",
+                            bHardcoded, (long long)r.pos);
+                if (bHardcoded)
+                {
+                    int64_t preIdx = r.pos;
+                    uint32_t nameIdx = r.ReadSIP();
+                    std::printf("[shadow]     FName: index=%u (read %lld bits)  pos=%lld\n",
+                                nameIdx, (long long)(r.pos - preIdx), (long long)r.pos);
+                }
+                else
+                {
+                    // String FName: SaveNum (32-bit LE) + chars + Number (32-bit LE)
+                    int32_t saveNum = (int32_t)r.ReadBitsLE(32);
+                    std::printf("[shadow]     FName: string SaveNum=%d  pos=%lld\n",
+                                saveNum, (long long)r.pos);
+                    int32_t absLen = saveNum < 0 ? -saveNum : saveNum;
+                    if (absLen > 512 || r.err)
+                    {
+                        std::printf("[shadow]     FName: SaveNum out of range — aborting bunch\n");
+                        break;
+                    }
+                    // skip chars (saveNum>0 → ANSI bytes, saveNum<0 → UTF-16 shorts)
+                    if (saveNum > 0) r.SkipBytes(saveNum);
+                    else if (saveNum < 0) { for (int i = 0; i < -saveNum && !r.err; ++i) r.ReadBitsLE(16); }
+                    r.ReadBitsLE(32); // ChNameNumber
+                }
+            }
+
+            // BunchDataBits = ReadInt(MaxPacket * 8). MaxPacket=1024 → max=8192.
+            int64_t preBDB = r.pos;
+            uint32_t bdb = r.ReadInt(8192);
+            std::printf("[shadow]     BDB=%u (read %lld bits)  pos=%lld  bitsLeft=%lld\n",
+                        bdb, (long long)(r.pos - preBDB),
+                        (long long)r.pos, (long long)(r.num - r.pos));
+
+            if (r.err || bdb > (uint32_t)(r.num - r.pos))
+            {
+                std::printf("[shadow]     BDB invalid or error — stopping\n");
+                break;
+            }
+
+            // Skip payload
+            for (uint32_t i = 0; i < bdb && !r.err; ++i) r.ReadBit();
+            std::printf("[shadow]     payload skipped  pos=%lld\n", (long long)r.pos);
+            ++bunchIdx;
+        }
+
+        std::printf("[shadow]   done: %d bunches, final pos=%lld num=%lld err=%d\n",
+                    bunchIdx, (long long)r.pos, (long long)r.num, (int)r.err);
+        std::fflush(stdout);
+    }
 
     // -----------------------------------------------------------------------
     // ReceivedRawPacket detour: dump (data, count). Direct comparison against
@@ -69,6 +315,9 @@ namespace BunchHook
         }
         std::printf("\n");
         std::fflush(stdout);
+
+        if (data && count > 0 && count < 4096)
+            ShadowDecodePacket(reinterpret_cast<const uint8_t*>(data), count);
 
         ReceivedRawPacket_Orig(thisConn, data, count);
         g_InRaw = false;
@@ -152,22 +401,82 @@ namespace BunchHook
     }
 
     // -----------------------------------------------------------------------
+    // FBitReader primitive read detours. Each logs Pos before and after, gated
+    // on (g_InRecv && thisAr == g_ActiveReader) so we get a complete transcript
+    // of every read inside UNetConnection::ReceivedPacket — without flooding the
+    // log with reads from replication, RPCs, or other code paths.
+    // -----------------------------------------------------------------------
+    inline void __fastcall SerializeBits_Detour(void* thisAr, void* dest, int64_t lengthBits)
+    {
+        const bool relevant = (g_InRecv && thisAr == g_ActiveReader);
+        const int64_t posBefore = relevant ? GetReaderPos(thisAr) : 0;
+        SerializeBits_Orig(thisAr, dest, lengthBits);
+        if (relevant)
+        {
+            const int64_t posAfter = GetReaderPos(thisAr);
+            std::printf("[bit] SerializeBits   Pos %5lld -> %5lld (req=%lld bits)\n",
+                        (long long)posBefore, (long long)posAfter, (long long)lengthBits);
+            std::fflush(stdout);
+        }
+    }
+
+    inline void __fastcall SerializeInt_Detour(void* thisAr, uint32_t* outValue, uint32_t valueMax)
+    {
+        const bool relevant = (g_InRecv && thisAr == g_ActiveReader);
+        const int64_t posBefore = relevant ? GetReaderPos(thisAr) : 0;
+        SerializeInt_Orig(thisAr, outValue, valueMax);
+        if (relevant)
+        {
+            const int64_t posAfter = GetReaderPos(thisAr);
+            const uint32_t v = outValue ? *outValue : 0;
+            std::printf("[bit] SerializeInt    Pos %5lld -> %5lld (max=%u) val=%u\n",
+                        (long long)posBefore, (long long)posAfter,
+                        (unsigned)valueMax, (unsigned)v);
+            std::fflush(stdout);
+        }
+    }
+
+    inline void __fastcall SerializeIntPacked_Detour(void* thisAr, uint32_t* outValue)
+    {
+        const bool relevant = (g_InRecv && thisAr == g_ActiveReader);
+        const int64_t posBefore = relevant ? GetReaderPos(thisAr) : 0;
+        SerializeIntPacked_Orig(thisAr, outValue);
+        if (relevant)
+        {
+            const int64_t posAfter = GetReaderPos(thisAr);
+            const uint32_t v = outValue ? *outValue : 0;
+            std::printf("[bit] SerializeIntPck Pos %5lld -> %5lld           val=%u\n",
+                        (long long)posBefore, (long long)posAfter, (unsigned)v);
+            std::fflush(stdout);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     inline bool Install()
     {
         HMODULE mod = GetModuleHandleA(nullptr);
         auto base = reinterpret_cast<uintptr_t>(mod);
 
-        void* recvPacketAddr    = reinterpret_cast<void*>(base + RVA_ReceivedPacket);
-        void* recvRawPacketAddr = reinterpret_cast<void*>(base + RVA_ReceivedRawPacket);
-        void* fnameReadAddr     = reinterpret_cast<void*>(base + RVA_FNameRead);
+        void* recvPacketAddr      = reinterpret_cast<void*>(base + RVA_ReceivedPacket);
+        void* recvRawPacketAddr   = reinterpret_cast<void*>(base + RVA_ReceivedRawPacket);
+        void* fnameReadAddr       = reinterpret_cast<void*>(base + RVA_FNameRead);
+        void* serializeBitsAddr   = reinterpret_cast<void*>(base + RVA_SerializeBits);
+        void* serializeIntAddr    = reinterpret_cast<void*>(base + RVA_SerializeInt);
+        void* serializeIntPckAddr = reinterpret_cast<void*>(base + RVA_SerializeIntPacked);
 
         std::printf("[bunchhook] module base=%p\n", mod);
-        std::printf("[bunchhook] ReceivedPacket    @ %p (RVA 0x%llX)\n",
+        std::printf("[bunchhook] ReceivedPacket      @ %p (RVA 0x%llX)\n",
                     recvPacketAddr, (unsigned long long)RVA_ReceivedPacket);
-        std::printf("[bunchhook] ReceivedRawPacket @ %p (RVA 0x%llX)\n",
+        std::printf("[bunchhook] ReceivedRawPacket   @ %p (RVA 0x%llX)\n",
                     recvRawPacketAddr, (unsigned long long)RVA_ReceivedRawPacket);
-        std::printf("[bunchhook] FNameRead         @ %p (RVA 0x%llX)\n",
+        std::printf("[bunchhook] FNameRead           @ %p (RVA 0x%llX)\n",
                     fnameReadAddr, (unsigned long long)RVA_FNameRead);
+        std::printf("[bunchhook] SerializeBits       @ %p (RVA 0x%llX)\n",
+                    serializeBitsAddr, (unsigned long long)RVA_SerializeBits);
+        std::printf("[bunchhook] SerializeInt        @ %p (RVA 0x%llX)\n",
+                    serializeIntAddr, (unsigned long long)RVA_SerializeInt);
+        std::printf("[bunchhook] SerializeIntPacked  @ %p (RVA 0x%llX)\n",
+                    serializeIntPckAddr, (unsigned long long)RVA_SerializeIntPacked);
 
         MH_Initialize();
 
@@ -199,6 +508,18 @@ namespace BunchHook
                          fnameReadAddr,
                          reinterpret_cast<void*>(&FNameRead_Detour),
                          reinterpret_cast<void**>(&FNameRead_Orig));
+        ok &= installOne("SerializeBits",
+                         serializeBitsAddr,
+                         reinterpret_cast<void*>(&SerializeBits_Detour),
+                         reinterpret_cast<void**>(&SerializeBits_Orig));
+        ok &= installOne("SerializeInt",
+                         serializeIntAddr,
+                         reinterpret_cast<void*>(&SerializeInt_Detour),
+                         reinterpret_cast<void**>(&SerializeInt_Orig));
+        ok &= installOne("SerializeIntPacked",
+                         serializeIntPckAddr,
+                         reinterpret_cast<void*>(&SerializeIntPacked_Detour),
+                         reinterpret_cast<void**>(&SerializeIntPacked_Orig));
         return ok;
     }
 }
