@@ -55,10 +55,6 @@ inline void __fastcall AESOutgoing_Hook(void* /*thisPtr*/, void* /*packet*/,
 // Signatures derived from Fortnite 17.50 (UE 4.26.1) FortniteClient-Win64-Shipping.exe
 // Functions confirmed at sub_143F5FB68 (Incoming) and sub_143F6003C (Outgoing).
 //
-// Previous sig was too generic and grabbed an unrelated function with the
-// same push sequence (runtime offset 0xCC8304 instead of 0x3F5FB68). The new
-// sigs extend into the unique function body where register choices diverge:
-//
 // Incoming distinctive bytes:
 //   48 8D 6C 24 D9        lea rbp, [rsp-0x27]    frame cookie D9 unique to Incoming
 //   48 81 EC 90 00 00 00  sub rsp, 0x90
