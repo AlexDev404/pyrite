@@ -10,6 +10,8 @@
 #include "memcury.h"
 #include "aesgcmhook.h"
 #include "oodlehook.h"
+#include "bunchhook.h"
+#include "loghook.h"
 #include <MinHook/MinHook.h>
 
 // Single Hook() entry-point used by aesgcmhook.h. Kept as a thin wrapper
@@ -17,52 +19,73 @@
 void Hook(void* Target, void* Detour)
 {
 #ifdef USE_MINHOOK
-    MH_CreateHook(Target, Detour, nullptr);
-    MH_EnableHook(Target);
+	MH_CreateHook(Target, Detour, nullptr);
+	MH_EnableHook(Target);
 #else
-    Memcury::VEHHook::AddHook(Target, Detour);
+	Memcury::VEHHook::AddHook(Target, Detour);
+#endif
+}
+
+// Trampoline variant: captures a pointer to the original function so the
+// detour can chain to it. Required for non-replacement hooks (e.g. tracing).
+void HookTramp(void* Target, void* Detour, void** ppOriginal)
+{
+#ifdef USE_MINHOOK
+	MH_CreateHook(Target, Detour, ppOriginal);
+	MH_EnableHook(Target);
+#else
+	// VEH backend: store the target as the "trampoline" -- VEH executes the
+	// original instructions in place after the detour returns, so jumping
+	// back to Target works.
+	if (ppOriginal) *ppOriginal = Target;
+	Memcury::VEHHook::AddHook(Target, Detour);
 #endif
 }
 
 DWORD WINAPI Main(LPVOID)
 {
-    AllocConsole();
-    FILE* fptr;
-    freopen_s(&fptr, "CONOUT$", "w+", stdout);
+	AllocConsole();
+	FILE* fptr;
+	freopen_s(&fptr, "CONOUT$", "w+", stdout);
 
-    std::cout << "Pyrite (AES-bypass build) initializing\n";
+	std::cout << "Pyrite (AES-bypass build) initializing\n";
 
 #ifdef USE_MINHOOK
-    MH_Initialize();
+	MH_Initialize();
 #else
-    Memcury::VEHHook::Init();
+	Memcury::VEHHook::Init();
 #endif
 
-    if (!InitializeAESBypass())
-    {
-        std::cout << "[AESBypass] Failed -- packets will stay encrypted.\n";
-        MessageBoxA(0, "Failed to install AES bypass hooks!", "Pyrite", MB_ICONERROR);
-        return 0;
-    }
+	if (!InitializeAESBypass())
+	{
+		std::cout << "[AESBypass] Failed -- packets will stay encrypted.\n";
+		MessageBoxA(0, "Failed to install AES bypass hooks!", "Pyrite", MB_ICONERROR);
+		return 0;
+	}
 
-    if (!InitializeOodleBypass())
-    {
-        std::cout << "[OodleBypass] Failed -- packets will stay compressed.\n";
-    }
+	if (!InitializeOodleBypass())
+	{
+		std::cout << "[OodleBypass] Failed -- packets will stay compressed.\n";
+	}
 
-    std::cout << "Pyrite ready.\n";
-    return 0;
+	  // Debug instrumentation. Function/category addresses hardcoded as RVAs.
+	  InitializeBunchHook();
+	  InitializeLogVerbosityFlip();
+	
+
+	std::cout << "Pyrite ready.\n";
+	return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/)
 {
-    switch (ul_reason_for_call)
-    {
-    case DLL_PROCESS_ATTACH:
-        CreateThread(0, 0, Main, 0, 0, 0);
-        break;
-    case DLL_PROCESS_DETACH:
-        break;
-    }
-    return TRUE;
+	switch (ul_reason_for_call)
+	{
+	case DLL_PROCESS_ATTACH:
+		CreateThread(0, 0, Main, 0, 0, 0);
+		break;
+	case DLL_PROCESS_DETACH:
+		break;
+	}
+	return TRUE;
 }
