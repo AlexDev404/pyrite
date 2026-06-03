@@ -22,6 +22,7 @@ namespace LogHook
     constexpr uintptr_t RVA_LogNet          = 0x099AA288;
     constexpr uintptr_t RVA_LogNetDormancy  = 0x099AA2D8;
     constexpr uintptr_t RVA_LogNetTraffic   = 0x099AA2B8;
+    constexpr uintptr_t RVA_LogHandshake    = 0x099AF240;
 
     enum ELogVerbosity : uint8_t
     {
@@ -50,5 +51,6 @@ inline bool InitializeLogVerbosityFlip()
     LogHook::Bump("LogNet",         LogHook::RVA_LogNet,         LogHook::VeryVerbose);
     LogHook::Bump("LogNetTraffic",  LogHook::RVA_LogNetTraffic,  LogHook::VeryVerbose);
     LogHook::Bump("LogNetDormancy", LogHook::RVA_LogNetDormancy, LogHook::VeryVerbose);
+    LogHook::Bump("LogHandshake",  LogHook::RVA_LogHandshake,  LogHook::VeryVerbose);
     return true;
 }
