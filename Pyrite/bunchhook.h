@@ -23,6 +23,15 @@ namespace BunchHook
 {
     constexpr uintptr_t RVA_ReceivedPacket    = 0x00F79464;
     constexpr uintptr_t RVA_ReceivedRawPacket = 0x012C3304;
+
+    // FName::AppendString(const FName*, FString&) — resolves ComparisonIndex to string.
+    // RVA from Dumpspace OFFSET_APPENDSTRING / CppSDK Basic.hpp Offsets::AppendString.
+    constexpr uintptr_t RVA_AppendString = 0x00E8B130;
+
+    // UNetConnection::Driver offset (CppSDK Engine_classes.hpp UNetConnection +0x58)
+    constexpr size_t OFF_NetConn_Driver = 0x58;
+    // UNetDriver::NetDriverName offset (CppSDK Engine_classes.hpp UNetDriver +0x190)
+    constexpr size_t OFF_NetDriver_Name = 0x190;
     // FName-from-bit-stream read. Found via HLIL of sub_140F79464:
     //   zmm1_3, zmm2_2 = sub_140e715d0(arg2, &var_2c0, zmm2_1, zmm0_1, zmm1_2)
     // Real signature is (FArchive*, FName*) — the zmm regs are compiler
@@ -64,6 +73,48 @@ namespace BunchHook
     inline thread_local bool g_InRecv = false;
     inline thread_local bool g_InRaw  = false;
     inline thread_local void* g_ActiveReader = nullptr; // populated while inside ReceivedPacket
+
+    // FName::AppendString function pointer, resolved once at Install() time.
+    using AppendString_t = void (__fastcall *)(const void* fname, void* outFString);
+    inline AppendString_t AppendString_Fn = nullptr;
+
+    // Resolve an FName (8-byte struct: ComparisonIndex u32 + Number u32) to a
+    // narrow string via the game's own FName::AppendString.  Returns a static
+    // thread-local buffer — caller must consume/copy before next call.
+    inline const char* ResolveFName(const void* fnamePtr)
+    {
+        static thread_local char narrowBuf[256];
+        narrowBuf[0] = '\0';
+
+        if (!AppendString_Fn || !fnamePtr) return narrowBuf;
+
+        // Build a minimal stack FString (TArray<wchar_t>): { Data*, NumElements, MaxElements }
+        wchar_t wideBuf[128] = {};
+        struct { wchar_t* Data; int32_t Num; int32_t Max; } tempStr = { wideBuf, 0, 128 };
+
+        AppendString_Fn(fnamePtr, &tempStr);
+
+        // Convert wchar_t → char (ASCII-safe for driver names)
+        int32_t len = tempStr.Num > 0 ? tempStr.Num - 1 : 0; // exclude null terminator
+        if (len > 255) len = 255;
+        for (int32_t i = 0; i < len; ++i)
+            narrowBuf[i] = (wideBuf[i] < 128) ? static_cast<char>(wideBuf[i]) : '?';
+        narrowBuf[len] = '\0';
+        return narrowBuf;
+    }
+
+    // Read the NetDriverName string from a UNetConnection's Driver pointer.
+    inline const char* GetDriverNameFromConn(void* thisConn)
+    {
+        if (!thisConn) return "???";
+        void* driver = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(thisConn) + OFF_NetConn_Driver);
+        if (!driver) return "NoDriver";
+        void* fnamePtr = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(driver) + OFF_NetDriver_Name);
+        const char* name = ResolveFName(fnamePtr);
+        return (name[0] != '\0') ? name : "EmptyName";
+    }
 
     // -----------------------------------------------------------------------
     // Shadow bit reader + packet decoder.
@@ -307,7 +358,8 @@ namespace BunchHook
         if (g_InRaw) { ReceivedRawPacket_Orig(thisConn, data, count); return; }
         g_InRaw = true;
 
-        std::printf("[rawpkt] conn=%p data=%p count=%d bytes:", thisConn, data, count);
+        const char* drvName = GetDriverNameFromConn(thisConn);
+        std::printf("[rawpkt][%s] conn=%p data=%p count=%d bytes:", drvName, thisConn, data, count);
         if (data && count > 0 && count < 4096)
         {
             auto* b = reinterpret_cast<uint8_t*>(data);
@@ -464,7 +516,12 @@ namespace BunchHook
         void* serializeIntAddr    = reinterpret_cast<void*>(base + RVA_SerializeInt);
         void* serializeIntPckAddr = reinterpret_cast<void*>(base + RVA_SerializeIntPacked);
 
+        // Resolve FName::AppendString — not hooked, just called directly.
+        AppendString_Fn = reinterpret_cast<AppendString_t>(base + RVA_AppendString);
+
         std::printf("[bunchhook] module base=%p\n", mod);
+        std::printf("[bunchhook] FName::AppendString @ %p (RVA 0x%llX)\n",
+                    reinterpret_cast<void*>(AppendString_Fn), (unsigned long long)RVA_AppendString);
         std::printf("[bunchhook] ReceivedPacket      @ %p (RVA 0x%llX)\n",
                     recvPacketAddr, (unsigned long long)RVA_ReceivedPacket);
         std::printf("[bunchhook] ReceivedRawPacket   @ %p (RVA 0x%llX)\n",
