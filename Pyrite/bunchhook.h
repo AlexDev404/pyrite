@@ -211,6 +211,15 @@ namespace BunchHook
             return;
         }
 
+        // UE4 game-packet preamble continues with:
+        //   HandshakeBit (1 bit)
+        //   bCompressedPacket/Oodle (1 bit)
+        // Shadow decode must consume these or all downstream fields are shifted.
+        uint8_t handshakeBit = r.ReadBit();
+        uint8_t bCompressed = r.ReadBit();
+        std::printf("[shadow]   Preamble: handshake=%u compressed=%u  pos=%lld\n",
+                    handshakeBit, bCompressed, (long long)r.pos);
+
         // --- PacketNotify packed header (32 bits raw LE) ---
         // Layout: bits[0..3]=HWC-1, bits[4..17]=AckedSeq, bits[18..31]=Seq
         uint32_t hdr = r.ReadBitsLE(32);
@@ -234,6 +243,157 @@ namespace BunchHook
         std::printf("[shadow]   PacketInfo: bHasFT=%u jitter=%u bHasSFT=%u sft=%u  pos=%lld bitsLeft=%lld\n",
                     bHasFT, jitter, bHasSFT, sftByte, (long long)r.pos, (long long)(r.num - r.pos));
 
+        enum class EStartupLayout : uint8_t
+        {
+            UE426Control = 0,
+            LegacyOpenRel = 1,
+            LegacyOpenPauseRel = 2,
+            OpenClosePauseRel = 3,
+        };
+        struct FProbe
+        {
+            bool ok = false;
+            int score = -9999;
+            int64_t startPos = -1;
+            EStartupLayout layout = EStartupLayout::UE426Control;
+            uint8_t bControl = 0, bOpen = 0, bClose = 0, bIsReplPaused = 0, bReliable = 0;
+            uint32_t chIndex = 0, nameIdx = 0xFFFFFFFFu, bdb = 0;
+            int64_t sipStart = -1;
+        };
+
+        auto ProbeFirstBunch = [&](int64_t startPos, EStartupLayout layout) -> FProbe
+        {
+            FProbe out;
+            out.startPos = startPos;
+            out.layout = layout;
+            if (startPos < 0 || startPos + 22 >= r.num) return out;
+
+            SBR s = r;
+            s.pos = startPos;
+            s.err = false;
+
+            if (layout == EStartupLayout::UE426Control)
+            {
+                out.bControl = s.ReadBit();
+                out.bOpen = out.bControl ? s.ReadBit() : 0;
+                out.bClose = out.bControl ? s.ReadBit() : 0;
+                if (out.bClose) (void)s.ReadInt(15);
+                out.bIsReplPaused = s.ReadBit();
+                out.bReliable = s.ReadBit();
+            }
+            else if (layout == EStartupLayout::LegacyOpenRel)
+            {
+                out.bControl = 0;
+                out.bOpen = s.ReadBit();
+                out.bClose = out.bOpen ? s.ReadBit() : 0;
+                if (out.bClose) (void)s.ReadInt(4);
+                out.bIsReplPaused = 0;
+                out.bReliable = s.ReadBit();
+            }
+            else if (layout == EStartupLayout::LegacyOpenPauseRel)
+            {
+                out.bControl = 0;
+                out.bOpen = s.ReadBit();
+                out.bClose = out.bOpen ? s.ReadBit() : 0;
+                if (out.bClose) (void)s.ReadInt(4);
+                out.bIsReplPaused = s.ReadBit();
+                out.bReliable = s.ReadBit();
+            }
+            else
+            {
+                out.bControl = 0;
+                out.bOpen = s.ReadBit();
+                out.bClose = s.ReadBit();
+                if (out.bClose) (void)s.ReadInt(4);
+                out.bIsReplPaused = s.ReadBit();
+                out.bReliable = s.ReadBit();
+            }
+
+            out.sipStart = s.pos;
+            out.chIndex = s.ReadSIP();
+            (void)s.ReadBit(); // bHasPMExports
+            (void)s.ReadBit(); // bHasMBMGuids
+            uint8_t bPartial = s.ReadBit();
+            if (out.bReliable) (void)s.ReadInt(1024);
+            if (bPartial) { (void)s.ReadBit(); (void)s.ReadBit(); }
+
+            bool bHasName = (out.bOpen || out.bReliable);
+            bool bHardcoded = false;
+            if (bHasName)
+            {
+                bHardcoded = (s.ReadBit() != 0);
+                if (bHardcoded) out.nameIdx = s.ReadSIP();
+                else out.nameIdx = 0xFFFFFFFEu; // string-name path
+            }
+            out.bdb = s.ReadInt(8192);
+            if (s.err || out.bdb > (uint32_t)(s.num - s.pos)) return out;
+            out.ok = true;
+
+            int score = 0;
+            score += 6; // valid read to BDB
+            if (out.sipStart >= 84 && out.sipStart <= 95) score += 3;
+            if (out.chIndex == 0) score += 6;
+            else if (out.chIndex < 64) score += 2;
+            else score -= 4;
+            if (out.bReliable) score += 2;
+            if (out.bControl && out.bOpen) score += 3;
+            if (bHasName && bHardcoded && out.nameIdx == 255) score += 6;
+            if (bHasName && bHardcoded && out.nameIdx < 512) score += 2;
+            if (bHasName && !bHardcoded) score -= 4;
+            if (count == 29 && out.bControl && out.bOpen && bHasName && bHardcoded) score += 5;
+            if (count == 33 && out.bdb == 112) score += 8;
+            if (count == 119 && out.bdb == 800) score += 8;
+            if (layout == EStartupLayout::UE426Control) score += 1;
+            out.score = score;
+            return out;
+        };
+
+        EStartupLayout startupLayout = EStartupLayout::UE426Control;
+        {
+            const int64_t anchorPos = r.pos;
+            FProbe best;
+
+            int64_t scanStart = anchorPos - 128;
+            if (scanStart < 0) scanStart = 0;
+            int64_t scanEnd = anchorPos + 128;
+            if (scanEnd > (r.num - 22)) scanEnd = (r.num - 22);
+            for (int64_t s = scanStart; s <= scanEnd; ++s)
+            {
+                const EStartupLayout layouts[] = {
+                    EStartupLayout::UE426Control,
+                    EStartupLayout::LegacyOpenRel,
+                    EStartupLayout::LegacyOpenPauseRel,
+                    EStartupLayout::OpenClosePauseRel
+                };
+                for (EStartupLayout layout : layouts)
+                {
+                    FProbe p = ProbeFirstBunch(s, layout);
+                    if (!p.ok) continue;
+                    if (p.score > best.score) best = p;
+                }
+            }
+
+            if (best.ok && best.score >= 12)
+            {
+                if (best.startPos != anchorPos)
+                {
+                    std::printf("[shadow]   startup resync: pos %lld -> %lld\n",
+                                (long long)anchorPos, (long long)best.startPos);
+                    r.pos = best.startPos;
+                }
+                startupLayout = best.layout;
+                std::printf("[shadow]   startup layout: %u score=%d sipStart=%lld ch=%u nameIdx=%u bdb=%u\n",
+                            (unsigned)startupLayout, best.score, (long long)best.sipStart,
+                            (unsigned)best.chIndex, (unsigned)best.nameIdx, (unsigned)best.bdb);
+            }
+            else if (best.ok)
+            {
+                std::printf("[shadow]   startup probe: best score=%d (below threshold) start=%lld layout=%u ch=%u nameIdx=%u bdb=%u\n",
+                            best.score, (long long)best.startPos, (unsigned)best.layout,
+                            (unsigned)best.chIndex, (unsigned)best.nameIdx, (unsigned)best.bdb);
+            }
+        }
+
         // --- Bunch loop ---
         int bunchIdx = 0;
         while (!r.err && (r.num - r.pos) >= 22)
@@ -242,30 +402,59 @@ namespace BunchHook
             std::printf("[shadow]   Bunch[%d] start pos=%lld bitsLeft=%lld\n",
                         bunchIdx, (long long)r.pos, (long long)(r.num - r.pos));
 
-            // Bunch flag layout (empirically derived, client6/server6 gap analysis):
-            //   bOpen=0          → 2 bits (bOpen + bReliable)
-            //   bOpen=1,Close=0  → 3 bits (bOpen + bClose + bReliable)
-            //   bOpen=1,Close=1  → 5 bits (bOpen + bClose + CloseReason(2) + bReliable)
-            // bIsReplicationPaused is NOT in the wire format.
-            uint8_t bOpen        = r.ReadBit();
-            uint8_t bClose       = 0;
+            EStartupLayout activeLayout = (bunchIdx == 0) ? startupLayout : EStartupLayout::UE426Control;
+            uint8_t bControl = 0, bOpen = 0, bClose = 0, bIsReplPaused = 0, bReliable = 0;
             uint32_t closeReason = 0;
-            if (bOpen)
+            if (activeLayout == EStartupLayout::UE426Control)
             {
-                bClose = r.ReadBit();
-                if (bClose)
-                    closeReason = r.ReadInt(4); // ReadInt(4) = 2 bits
+                bControl = r.ReadBit();
+                bOpen = bControl ? r.ReadBit() : 0;
+                bClose = bControl ? r.ReadBit() : 0;
+                if (bClose) closeReason = r.ReadInt(15);
+                bIsReplPaused = r.ReadBit();
+                bReliable = r.ReadBit();
             }
-            uint8_t bReliable = r.ReadBit(); // unconditional
+            else if (activeLayout == EStartupLayout::LegacyOpenRel)
+            {
+                bControl = 0;
+                bOpen = r.ReadBit();
+                bClose = bOpen ? r.ReadBit() : 0;
+                if (bClose) closeReason = r.ReadInt(4);
+                bIsReplPaused = 0;
+                bReliable = r.ReadBit();
+            }
+            else if (activeLayout == EStartupLayout::LegacyOpenPauseRel)
+            {
+                bControl = 0;
+                bOpen = r.ReadBit();
+                bClose = bOpen ? r.ReadBit() : 0;
+                if (bClose) closeReason = r.ReadInt(4);
+                bIsReplPaused = r.ReadBit();
+                bReliable = r.ReadBit();
+            }
+            else
+            {
+                bControl = 0;
+                bOpen = r.ReadBit();
+                bClose = r.ReadBit();
+                if (bClose) closeReason = r.ReadInt(4);
+                bIsReplPaused = r.ReadBit();
+                bReliable = r.ReadBit();
+            }
 
-            std::printf("[shadow]     bOpen=%u bClose=%u closeReason=%u bReliable=%u  pos=%lld\n",
-                        bOpen, bClose, closeReason, bReliable, (long long)r.pos);
+            std::printf("[shadow]     bControl=%u bOpen=%u bClose=%u closeReason=%u bIsReplPaused=%u bReliable=%u  pos=%lld\n",
+                        bControl, bOpen, bClose, closeReason, bIsReplPaused, bReliable, (long long)r.pos);
 
             // ChIndex (EngineNetVer>=3 → SerializeIntPacked)
             int64_t preChIdx = r.pos;
             uint32_t chIndex = r.ReadSIP();
             std::printf("[shadow]     ChIndex=%u (read %lld bits)  pos=%lld\n",
                         chIndex, (long long)(r.pos - preChIdx), (long long)r.pos);
+            if (chIndex > 8192)
+            {
+                std::printf("[shadow]     ChIndex out of startup range — stopping\n");
+                break;
+            }
 
             // ReadA / ReadB / ReadC
             uint8_t bHasPMExports = r.ReadBit();
@@ -305,6 +494,11 @@ namespace BunchHook
                     uint32_t nameIdx = r.ReadSIP();
                     std::printf("[shadow]     FName: index=%u (read %lld bits)  pos=%lld\n",
                                 nameIdx, (long long)(r.pos - preIdx), (long long)r.pos);
+                    if (nameIdx > 2048)
+                    {
+                        std::printf("[shadow]     FName index out of startup range — stopping\n");
+                        break;
+                    }
                 }
                 else
                 {
